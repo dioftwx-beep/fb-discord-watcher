@@ -1,1 +1,12 @@
-
+{
+  "name": "fb-discord-watcher",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node watcher.js"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  }
+}
