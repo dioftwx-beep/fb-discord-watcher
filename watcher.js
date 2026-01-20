@@ -1,10 +1,10 @@
-// watcher.js
-// FB Page -> Discord Watcher (ESM)
-// - Fetches latest Page posts
-// - Sends NEW posts to Discord with image embeds
+// watcher.js (ESM)
+// FB Page -> Discord Watcher
+// - Fetches latest Page posts via Graph API
+// - Sends NEW posts to Discord with an embed (includes image when available)
 // - Stores last_post_id in state.json
 
-import { readFileSync, writeFileSync } from "fs";
+import fs from "fs";
 
 const FB_PAGE_ID = process.env.FB_PAGE_ID;
 const FB_PAGE_ACCESS_TOKEN = process.env.FB_PAGE_ACCESS_TOKEN;
@@ -13,24 +13,20 @@ const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const STATE_FILE = "state.json";
 const POSTS_LIMIT = parseInt(process.env.POSTS_LIMIT || "5", 10);
 
-// ---------- helpers ----------
-
 function requireEnv(name, value) {
-  if (!value) {
-    throw new Error(`Missing env: ${name}`);
-  }
+  if (!value) throw new Error(`Missing env: ${name}`);
 }
 
 function loadState() {
   try {
-    return JSON.parse(readFileSync(STATE_FILE, "utf8"));
+    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   } catch {
     return { last_post_id: null };
   }
 }
 
 function saveState(state) {
-  writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
 async function fbFetch(path) {
@@ -42,53 +38,67 @@ async function fbFetch(path) {
   try {
     json = JSON.parse(text);
   } catch {
-    throw new Error(`FB HTTP ${res.status}: Non-JSON response`);
+    throw new Error(
+      `FB HTTP ${res.status}: Non-JSON response: ${text.slice(0, 250)}`
+    );
   }
 
   if (!res.ok || json.error) {
     throw new Error(`FB HTTP ${res.status}: ${JSON.stringify(json)}`);
   }
-
   return json;
 }
 
+function cleanText(s) {
+  if (!s) return "";
+  return String(s).trim();
+}
+
 function pickImageFromPost(post) {
-  // 1️⃣ classic photo post
+  // 1) classic photo post usually has this
   if (post.full_picture) return post.full_picture;
 
-  // 2️⃣ attachment image
-  const att = post.attachments?.data?.[0];
-  const direct = att?.media?.image?.src;
+  const att0 = post.attachments?.data?.[0];
+  if (!att0) return null;
+
+  // 2) direct attachment image
+  const direct = att0?.media?.image?.src;
   if (direct) return direct;
 
-  // 3️⃣ carousel / multi-photo
-  const sub = att?.subattachments?.data?.[0]?.media?.image?.src;
-  if (sub) return sub;
+  // 3) multi-photo / albums / some shares
+  const subs = att0?.subattachments?.data || [];
+  for (const s of subs) {
+    const subImg = s?.media?.image?.src;
+    if (subImg) return subImg;
+  }
 
+  // 4) sometimes share previews hide it; best effort ends here
   return null;
 }
 
-function cleanText(s) {
-  return s ? String(s).trim() : "";
+function buildTitleFromMessage(msg) {
+  if (!msg) return "New Facebook Page post";
+  const oneLine = msg.replace(/\s+/g, " ").trim();
+  return oneLine.length > 80 ? oneLine.slice(0, 77) + "..." : oneLine;
 }
 
 async function sendToDiscord({ title, url, description, imageUrl, timestamp }) {
-  const payload = {
-    username: "Spidey Bot",
-    content: "New Facebook Page post",
-    embeds: [
-      {
-        title,
-        url,
-        description,
-        timestamp,
-      },
-    ],
+  const embed = {
+    title: title || "New post",
+    url,
+    description: (description || "").slice(0, 3500),
+    timestamp: timestamp || new Date().toISOString(),
   };
 
   if (imageUrl) {
-    payload.embeds[0].image = { url: imageUrl };
+    embed.image = { url: imageUrl };
   }
+
+  const payload = {
+    username: "Spidey Bot",
+    content: "New Facebook Page post",
+    embeds: [embed],
+  };
 
   const res = await fetch(DISCORD_WEBHOOK_URL, {
     method: "POST",
@@ -101,8 +111,6 @@ async function sendToDiscord({ title, url, description, imageUrl, timestamp }) {
     throw new Error(`Discord HTTP ${res.status}: ${body}`);
   }
 }
-
-// ---------- main ----------
 
 async function main() {
   requireEnv("FB_PAGE_ID", FB_PAGE_ID);
@@ -117,7 +125,7 @@ async function main() {
     "created_time",
     "permalink_url",
     "full_picture",
-    "attachments{media,type,subattachments{media}}",
+    "attachments{media,type,url,subattachments{media}}",
   ].join(",");
 
   const postsResp = await fbFetch(
@@ -127,7 +135,6 @@ async function main() {
   );
 
   const posts = postsResp.data || [];
-
   console.log(`DEBUG: posts fetched = ${posts.length}`);
   console.log(`DEBUG: last_post_id(state) = ${state.last_post_id}`);
 
@@ -136,7 +143,7 @@ async function main() {
     return;
   }
 
-  // první běh – jen uložíme state
+  // First run: initialize state to newest post to avoid spamming old posts
   if (!state.last_post_id) {
     state.last_post_id = posts[0].id;
     saveState(state);
@@ -144,7 +151,7 @@ async function main() {
     return;
   }
 
-  // nové posty
+  // Collect posts newer than last_post_id
   const newPosts = [];
   for (const p of posts) {
     if (p.id === state.last_post_id) break;
@@ -158,37 +165,38 @@ async function main() {
     return;
   }
 
-  // posílat od nejstaršího
+  // Send oldest -> newest
   newPosts.reverse();
 
   for (const p of newPosts) {
     const url = p.permalink_url || `https://www.facebook.com/${p.id}`;
     const msg = cleanText(p.message);
+    const title = buildTitleFromMessage(msg);
     const imageUrl = pickImageFromPost(p);
 
-    const title = msg
-      ? msg.length > 80
-        ? msg.slice(0, 77) + "…"
-        : msg
-      : "New Facebook post";
+    console.log(
+      `DEBUG: sending post=${p.id} hasImage=${imageUrl ? "yes" : "no"}`
+    );
 
     await sendToDiscord({
       title,
       url,
-      description: msg,
+      description: msg || "(no text)",
       imageUrl,
-      timestamp: p.created_time,
+      timestamp: p.created_time ? new Date(p.created_time).toISOString() : null,
     });
 
     console.log(`Sent: ${p.id}`);
+
+    // Update state after each successful send
+    state.last_post_id = p.id;
+    saveState(state);
   }
 
-  state.last_post_id = newPosts[newPosts.length - 1].id;
-  saveState(state);
   console.log("State updated.");
 }
 
-main().catch((err) => {
-  console.error(err);
+main().catch((e) => {
+  console.error(e);
   process.exit(1);
 });
