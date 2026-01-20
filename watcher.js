@@ -1,7 +1,7 @@
 // watcher.js
 // FB Page -> Discord Watcher
 // - Fetches latest Page posts via Graph API
-// - Sends NEW posts to Discord with an embed (includes image when available)
+// - Sends NEW posts to Discord with an embed + image (uploaded as attachment for reliability)
 // - Stores last_post_id in state.json
 
 const fs = require("fs");
@@ -14,9 +14,7 @@ const STATE_FILE = "state.json";
 const POSTS_LIMIT = parseInt(process.env.POSTS_LIMIT || "5", 10);
 
 function requireEnv(name, value) {
-  if (!value) {
-    throw new Error(`Missing env: ${name}`);
-  }
+  if (!value) throw new Error(`Missing env: ${name}`);
 }
 
 function loadState() {
@@ -35,12 +33,14 @@ async function fbFetch(path) {
   const url = `https://graph.facebook.com/v24.0/${path}`;
   const res = await fetch(url);
   const text = await res.text();
+
   let json;
   try {
     json = JSON.parse(text);
   } catch {
-    throw new Error(`FB HTTP ${res.status}: Non-JSON response: ${text.slice(0, 200)}`);
+    throw new Error(`FB HTTP ${res.status}: Non-JSON response: ${text.slice(0, 300)}`);
   }
+
   if (!res.ok || json.error) {
     throw new Error(`FB HTTP ${res.status}: ${JSON.stringify(json)}`);
   }
@@ -48,45 +48,84 @@ async function fbFetch(path) {
 }
 
 function pickImageFromPost(post) {
-  // Best effort:
-  // 1) full_picture (often works for photo posts)
-  // 2) attachments.media.image.src
-  // 3) attachments.subattachments[].media.image.src
+  // 1) full_picture (works for many posts)
   if (post.full_picture) return post.full_picture;
 
-  const att = post.attachments?.data?.[0];
-  const direct = att?.media?.image?.src;
+  // 2) attachments.media.image.src
+  const att0 = post.attachments?.data?.[0];
+  const direct = att0?.media?.image?.src;
   if (direct) return direct;
 
-  const sub = att?.subattachments?.data?.[0]?.media?.image?.src;
+  // 3) subattachments (album / multi-photo)
+  const sub = att0?.subattachments?.data?.[0]?.media?.image?.src;
   if (sub) return sub;
 
   return null;
 }
 
 function cleanText(s) {
-  if (!s) return "";
-  return String(s).trim();
+  return (s ? String(s) : "").trim();
+}
+
+function makeTitleFromMessage(msg) {
+  if (!msg) return "New Facebook Page post";
+  const oneLine = msg.replace(/\s+/g, " ").trim();
+  return oneLine.length > 80 ? oneLine.slice(0, 77) + "..." : oneLine;
 }
 
 async function sendToDiscord({ title, url, description, imageUrl, timestamp }) {
-  // Discord embed
-  const payload = {
-    username: "Spidey Bot",
-    content: "New Facebook Page post",
-    embeds: [
-      {
-        title: title || "New post",
-        url,
-        description: description?.slice(0, 3500) || "",
-        timestamp: timestamp || new Date().toISOString(),
-      },
-    ],
+  // Base embed
+  const embed = {
+    title: title || "New post",
+    url,
+    description: (description || "").slice(0, 3500),
+    timestamp: timestamp || new Date().toISOString(),
   };
 
+  // If we have an image -> upload it as attachment (most reliable)
   if (imageUrl) {
-    payload.embeds[0].image = { url: imageUrl };
+    try {
+      const imgRes = await fetch(imageUrl);
+      if (imgRes.ok) {
+        const arr = await imgRes.arrayBuffer();
+        const buf = Buffer.from(arr);
+
+        // Discord: reference attachment in embed via attachment://filename
+        embed.image = { url: "attachment://image.jpg" };
+
+        const payload = {
+          username: "Spidey Bot",
+          content: `New Facebook Page post\n${url}`,
+          embeds: [embed],
+        };
+
+        const form = new FormData();
+        form.append("payload_json", JSON.stringify(payload));
+        form.append("files[0]", new Blob([buf]), "image.jpg");
+
+        const res = await fetch(DISCORD_WEBHOOK_URL, {
+          method: "POST",
+          body: form,
+        });
+
+        if (!res.ok) {
+          const body = await res.text();
+          throw new Error(`Discord HTTP ${res.status}: ${body}`);
+        }
+        return;
+      }
+      // If download fails, fall back to embed without attachment below
+    } catch (e) {
+      console.log("WARN: image download/upload failed, fallback to normal embed:", e?.message || e);
+    }
   }
+
+  // Fallback: normal embed (no uploaded image)
+  const payload = {
+    username: "Spidey Bot",
+    content: `New Facebook Page post\n${url}`,
+    embeds: [embed],
+  };
 
   const res = await fetch(DISCORD_WEBHOOK_URL, {
     method: "POST",
@@ -107,16 +146,17 @@ async function main() {
 
   const state = loadState();
 
-  // Fetch latest posts with fields that include image URLs
+  // Important: request fields including image + attachments
   const fields = [
     "id",
     "message",
     "created_time",
     "permalink_url",
     "full_picture",
-    "attachments{media,type,url,subattachments{media}}",
+    "attachments{media{image},type,url,subattachments{media{image}}}",
   ].join(",");
 
+  // /posts is OK for Page posts
   const postsResp = await fbFetch(
     `${FB_PAGE_ID}/posts?fields=${encodeURIComponent(fields)}&limit=${POSTS_LIMIT}&access_token=${encodeURIComponent(
       FB_PAGE_ACCESS_TOKEN
@@ -132,7 +172,7 @@ async function main() {
     return;
   }
 
-  // If first run, initialize state to newest post
+  // First run: just initialize (no spam)
   if (!state.last_post_id) {
     state.last_post_id = posts[0].id;
     saveState(state);
@@ -140,7 +180,7 @@ async function main() {
     return;
   }
 
-  // Find new posts until we hit last_post_id
+  // Collect new posts until we hit last_post_id
   const newPosts = [];
   for (const p of posts) {
     if (p.id === state.last_post_id) break;
@@ -161,5 +201,24 @@ async function main() {
     const msg = cleanText(p.message);
     const imageUrl = pickImageFromPost(p);
 
-    // Title: if message empty, use page name-ish
-    const title = msg ? (msg.length > 80 ? msg.slice(
+    await sendToDiscord({
+      title: makeTitleFromMessage(msg),
+      url,
+      description: msg || " ",
+      imageUrl,
+      timestamp: p.created_time || new Date().toISOString(),
+    });
+
+    console.log(`Sent: ${p.id}`);
+  }
+
+  // Update state to newest fetched post
+  state.last_post_id = posts[0].id;
+  saveState(state);
+  console.log("State updated.");
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
