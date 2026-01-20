@@ -1,10 +1,10 @@
 // watcher.js
-// FB Page -> Discord Watcher
-// - Fetches latest Page posts via Graph API
-// - Sends NEW posts to Discord with an embed + image (uploaded as attachment for reliability)
+// FB Page -> Discord Watcher (ESM)
+// - Fetches latest Page posts
+// - Sends NEW posts to Discord with image embeds
 // - Stores last_post_id in state.json
 
-const fs = require("fs");
+import { readFileSync, writeFileSync } from "fs";
 
 const FB_PAGE_ID = process.env.FB_PAGE_ID;
 const FB_PAGE_ACCESS_TOKEN = process.env.FB_PAGE_ACCESS_TOKEN;
@@ -13,20 +13,24 @@ const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const STATE_FILE = "state.json";
 const POSTS_LIMIT = parseInt(process.env.POSTS_LIMIT || "5", 10);
 
+// ---------- helpers ----------
+
 function requireEnv(name, value) {
-  if (!value) throw new Error(`Missing env: ${name}`);
+  if (!value) {
+    throw new Error(`Missing env: ${name}`);
+  }
 }
 
 function loadState() {
   try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    return JSON.parse(readFileSync(STATE_FILE, "utf8"));
   } catch {
     return { last_post_id: null };
   }
 }
 
 function saveState(state) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
 async function fbFetch(path) {
@@ -38,94 +42,53 @@ async function fbFetch(path) {
   try {
     json = JSON.parse(text);
   } catch {
-    throw new Error(`FB HTTP ${res.status}: Non-JSON response: ${text.slice(0, 300)}`);
+    throw new Error(`FB HTTP ${res.status}: Non-JSON response`);
   }
 
   if (!res.ok || json.error) {
     throw new Error(`FB HTTP ${res.status}: ${JSON.stringify(json)}`);
   }
+
   return json;
 }
 
 function pickImageFromPost(post) {
-  // 1) full_picture (works for many posts)
+  // 1️⃣ classic photo post
   if (post.full_picture) return post.full_picture;
 
-  // 2) attachments.media.image.src
-  const att0 = post.attachments?.data?.[0];
-  const direct = att0?.media?.image?.src;
+  // 2️⃣ attachment image
+  const att = post.attachments?.data?.[0];
+  const direct = att?.media?.image?.src;
   if (direct) return direct;
 
-  // 3) subattachments (album / multi-photo)
-  const sub = att0?.subattachments?.data?.[0]?.media?.image?.src;
+  // 3️⃣ carousel / multi-photo
+  const sub = att?.subattachments?.data?.[0]?.media?.image?.src;
   if (sub) return sub;
 
   return null;
 }
 
 function cleanText(s) {
-  return (s ? String(s) : "").trim();
-}
-
-function makeTitleFromMessage(msg) {
-  if (!msg) return "New Facebook Page post";
-  const oneLine = msg.replace(/\s+/g, " ").trim();
-  return oneLine.length > 80 ? oneLine.slice(0, 77) + "..." : oneLine;
+  return s ? String(s).trim() : "";
 }
 
 async function sendToDiscord({ title, url, description, imageUrl, timestamp }) {
-  // Base embed
-  const embed = {
-    title: title || "New post",
-    url,
-    description: (description || "").slice(0, 3500),
-    timestamp: timestamp || new Date().toISOString(),
-  };
-
-  // If we have an image -> upload it as attachment (most reliable)
-  if (imageUrl) {
-    try {
-      const imgRes = await fetch(imageUrl);
-      if (imgRes.ok) {
-        const arr = await imgRes.arrayBuffer();
-        const buf = Buffer.from(arr);
-
-        // Discord: reference attachment in embed via attachment://filename
-        embed.image = { url: "attachment://image.jpg" };
-
-        const payload = {
-          username: "Spidey Bot",
-          content: `New Facebook Page post\n${url}`,
-          embeds: [embed],
-        };
-
-        const form = new FormData();
-        form.append("payload_json", JSON.stringify(payload));
-        form.append("files[0]", new Blob([buf]), "image.jpg");
-
-        const res = await fetch(DISCORD_WEBHOOK_URL, {
-          method: "POST",
-          body: form,
-        });
-
-        if (!res.ok) {
-          const body = await res.text();
-          throw new Error(`Discord HTTP ${res.status}: ${body}`);
-        }
-        return;
-      }
-      // If download fails, fall back to embed without attachment below
-    } catch (e) {
-      console.log("WARN: image download/upload failed, fallback to normal embed:", e?.message || e);
-    }
-  }
-
-  // Fallback: normal embed (no uploaded image)
   const payload = {
     username: "Spidey Bot",
-    content: `New Facebook Page post\n${url}`,
-    embeds: [embed],
+    content: "New Facebook Page post",
+    embeds: [
+      {
+        title,
+        url,
+        description,
+        timestamp,
+      },
+    ],
   };
+
+  if (imageUrl) {
+    payload.embeds[0].image = { url: imageUrl };
+  }
 
   const res = await fetch(DISCORD_WEBHOOK_URL, {
     method: "POST",
@@ -139,6 +102,8 @@ async function sendToDiscord({ title, url, description, imageUrl, timestamp }) {
   }
 }
 
+// ---------- main ----------
+
 async function main() {
   requireEnv("FB_PAGE_ID", FB_PAGE_ID);
   requireEnv("FB_PAGE_ACCESS_TOKEN", FB_PAGE_ACCESS_TOKEN);
@@ -146,17 +111,15 @@ async function main() {
 
   const state = loadState();
 
-  // Important: request fields including image + attachments
   const fields = [
     "id",
     "message",
     "created_time",
     "permalink_url",
     "full_picture",
-    "attachments{media{image},type,url,subattachments{media{image}}}",
+    "attachments{media,type,subattachments{media}}",
   ].join(",");
 
-  // /posts is OK for Page posts
   const postsResp = await fbFetch(
     `${FB_PAGE_ID}/posts?fields=${encodeURIComponent(fields)}&limit=${POSTS_LIMIT}&access_token=${encodeURIComponent(
       FB_PAGE_ACCESS_TOKEN
@@ -164,6 +127,7 @@ async function main() {
   );
 
   const posts = postsResp.data || [];
+
   console.log(`DEBUG: posts fetched = ${posts.length}`);
   console.log(`DEBUG: last_post_id(state) = ${state.last_post_id}`);
 
@@ -172,7 +136,7 @@ async function main() {
     return;
   }
 
-  // First run: just initialize (no spam)
+  // první běh – jen uložíme state
   if (!state.last_post_id) {
     state.last_post_id = posts[0].id;
     saveState(state);
@@ -180,7 +144,7 @@ async function main() {
     return;
   }
 
-  // Collect new posts until we hit last_post_id
+  // nové posty
   const newPosts = [];
   for (const p of posts) {
     if (p.id === state.last_post_id) break;
@@ -188,12 +152,13 @@ async function main() {
   }
 
   console.log(`DEBUG: new posts to send = ${newPosts.length}`);
+
   if (newPosts.length === 0) {
     console.log("No new items.");
     return;
   }
 
-  // Send oldest -> newest
+  // posílat od nejstaršího
   newPosts.reverse();
 
   for (const p of newPosts) {
@@ -201,24 +166,29 @@ async function main() {
     const msg = cleanText(p.message);
     const imageUrl = pickImageFromPost(p);
 
+    const title = msg
+      ? msg.length > 80
+        ? msg.slice(0, 77) + "…"
+        : msg
+      : "New Facebook post";
+
     await sendToDiscord({
-      title: makeTitleFromMessage(msg),
+      title,
       url,
-      description: msg || " ",
+      description: msg,
       imageUrl,
-      timestamp: p.created_time || new Date().toISOString(),
+      timestamp: p.created_time,
     });
 
     console.log(`Sent: ${p.id}`);
   }
 
-  // Update state to newest fetched post
-  state.last_post_id = posts[0].id;
+  state.last_post_id = newPosts[newPosts.length - 1].id;
   saveState(state);
   console.log("State updated.");
 }
 
-main().catch((e) => {
-  console.error(e);
+main().catch((err) => {
+  console.error(err);
   process.exit(1);
 });
